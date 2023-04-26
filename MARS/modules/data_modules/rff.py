@@ -12,7 +12,7 @@ psd_kernels = tfp.math.psd_kernels
 
 def get_data(num_pts: int, num_fns: int, num_iters: int = 30, key: jax.random.PRNGKey = None, num_features: int = 1000,
              lengthscale: float = 1., x_min: float = -3., x_max: float = 3., kernel: str = 'eq',
-             coefficient: float = 1., max_num_pts: int = 1000, mean_fn: callable = None, full_model: bool = False):
+             coefficient: float = 1., max_num_pts: int = 1000):
     """ Obtains the dataset containing functional evaluations of GPS usinr RFF (random Fourier features). """
     assert num_pts <= max_num_pts
     keys = iter(jax.random.split(key, int(num_iters + 5)))
@@ -24,23 +24,18 @@ def get_data(num_pts: int, num_fns: int, num_iters: int = 30, key: jax.random.PR
                    num_functions=num_fns,
                    num_features=num_features,
                    key=key)
-    if mean_fn is not None:
-        assert mean_fn(x).shape == y[..., 0].shape
-        y += jax.vmap(lambda a: a + mean_fn(x), 1, 1)(y)
+
     index_pts = []
     fun_evals = []
     scores = []
-    for _ in tqdm(range(num_iters), desc="Obtaining RFF data:"):
-        indices = jnp.sort(jax.random.randint(next(keys), (num_pts,), minval=0, maxval=max_num_pts))
+    for _ in tqdm(range(num_iters + 1), desc="Obtaining RFF data"):
+        indices = jax.random.randint(next(keys), (num_pts,), minval=0, maxval=max_num_pts)
         xs = x[indices]
-        ys = vmap(lambda ind, fn: fn[ind], (None, 1))(indices, y)
+        ys = y[indices].T
         index_pts.append(xs)
         fun_evals.append(ys)
-        scores.append(vmap(lambda y_: get_score(xs, y_, psd_kernels.ExponentiatedQuadratic()))(ys))
-    if full_model:
-        return index_pts, fun_evals, scores
-    else:
-        return iter(index_pts), iter(fun_evals), iter(scores)
+        scores.append(vmap(lambda y_: get_score(xs, y_))(ys))
+    return iter(index_pts), iter(fun_evals), iter(scores)
 
 
 @partial(jit, static_argnums=(1, 3, 4, 6))
@@ -83,7 +78,7 @@ def sample_rff(x: jnp.ndarray, kernel: psd_kernels, lengthscale: float, num_func
 
 
 @partial(jit, static_argnums=(2,))
-def get_score(xs: jnp.ndarray, ys: jnp.ndarray, kernel: psd_kernels = psd_kernels.Constant(0.)):
+def get_score(xs: jnp.ndarray, ys: jnp.ndarray, kernel: psd_kernels = psd_kernels.ExponentiatedQuadratic()):
     """ Helper function for calculation of the GP score. """
     gp = tfd.GaussianProcess(
         kernel, index_points=xs, observation_noise_variance=1e-7

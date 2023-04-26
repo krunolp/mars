@@ -6,6 +6,7 @@ import haiku as hk
 import warnings
 
 from typing import Any
+from tqdm import tqdm
 from tensorflow_probability.substrates import jax as tfp
 from jax import vmap
 from MARS.modules.attention_modules.architectures_refactored import arch1
@@ -122,12 +123,13 @@ class ScoreEstimator:
                                    grad_pen_const=grad_pen_const
                                    )
         self.loss = loss_init.apply
+        self.spectr_norm = loss_init.spectr_norm_apply
 
-    def train(self, n_fns: int = 20, n_iter: int = 1000, log_iter: int = 100, key: hk.PRNGSequence = None):
+    def train(self, n_fns: int = 20, n_iter: int = 1000, log_iter: int = 10, key: hk.PRNGSequence = None):
         """ Main training loop. """
 
         # using RFF to simulate the data
-        x_iter, y_iter, score_iter = get_data(self.num_meas_pts, n_fns, num_iters=n_iter)
+        x_iter, y_iter, score_iter = get_data(self.num_meas_pts, n_fns, num_iters=n_iter, key=next(key))
         x, y, score = next(x_iter), next(y_iter), next(score_iter)
 
         x_fx_init = vmap(lambda y_: jnp.stack((x[..., 0], y_), -1))(y)
@@ -136,23 +138,24 @@ class ScoreEstimator:
         opt_state = self.optimizer.init(param)
 
         # training loop
-        for i in range(n_iter):
+        for i in tqdm(range(n_iter), desc="Training score network"):
             x, y, true_score = next(x_iter), next(y_iter), next(score_iter)
+            if self.loss_type == 'exact_w_spectr_norm': param = self.spectr_norm(param)
             x_fx = vmap(lambda y_: jnp.stack((x[..., 0], y_), -1))(y)
 
-            l, grads = jax.value_and_grad(self.loss)(param, x_fx, next(hk_key))
+            l, grads = jax.value_and_grad(self.loss)(param, x_fx, next(key))
             updates, opt_state = self.optimizer.update(grads, opt_state, param)
             param = optax.apply_updates(param, updates)
 
-            if i % log_iter == 0:
-                est_score = jax.vmap(lambda xx: self.nn.apply(param, next(hk_key), xx))(x_fx)
+            if i % log_iter == 0 and i > 0:
+                est_score = jax.vmap(lambda xx: self.nn.apply(param, next(key), xx))(x_fx)
                 cos_sim = jnp.mean(optax.cosine_similarity(true_score, est_score))
                 mse = jnp.mean(jnp.square(true_score - est_score))
 
                 print("Cos. sim. is : ", cos_sim, " MSE is: ", mse)
-                self.plot_interp(param, next(hk_key))
+                self.plot_interp(param, i, next(key))
 
-    def plot_interp(self, param: jnp.ndarray, rng_key: jax.random.PRNGKey, num_evals: int = 50):
+    def plot_interp(self, param: jnp.ndarray, it: int, rng_key: jax.random.PRNGKey, num_evals: int = 50):
         """ Plots the corresponding predicted score and the numerically integrated distribution. """
         key, subkey = jax.random.split(rng_key)
         fig, axs = plt.subplots(2, 2)
@@ -164,30 +167,33 @@ class ScoreEstimator:
 
         x_fx = jnp.stack((jnp.stack((x1, x2), -1), jnp.stack((f_zeros, f_interp), -1)), -1)
         preds1 = vmap(lambda xfx: self.nn.apply(param, key, xfx))(x_fx)[..., 1]
-        axs[0, 0].plot(f_interp, preds1, label='predicted')
-        axs[0, 0].plot(f_interp, -f_interp, label='true')
+        axs[0, 0].plot(f_interp, preds1, label='predicted', color='#42529C')
+        axs[0, 0].plot(f_interp, -f_interp, label='true', linestyle='--', color='#4958AD')
         axs[0, 0].set_title('Score: x=-0.5')
+        axs[0, 0].legend()
 
         x_distr1, y_distr1 = numeric_integration(f_interp, preds1)
 
-        axs[0, 1].plot(x_distr1, y_distr1, label='predicted')
-        axs[0, 1].plot(x_distr1, jnp.exp(-x_distr1 ** 2) / jnp.sum(jnp.exp(-x_distr1 ** 2)), label='true')
+        axs[0, 1].plot(x_distr1, y_distr1, label='predicted', color='#42529C')
+        axs[0, 1].plot(x_distr1, jnp.exp(-x_distr1 ** 2) / jnp.sum(jnp.exp(-x_distr1 ** 2)), label='true',
+                       linestyle='--', color='#4958AD')
         axs[0, 1].set_title('Distr:  x=-0.5')
 
         x_fx = jnp.stack((jnp.stack((x1, x2), -1), jnp.stack((f_interp, f_zeros), -1)), -1)
         preds2 = vmap(lambda xfx: self.nn.apply(param, subkey, xfx))(x_fx)[..., 0]
-        axs[1, 0].plot(f_interp, preds2, label='predicted')
-        axs[1, 0].plot(f_interp, -f_interp, label='true')
+        axs[1, 0].plot(f_interp, preds2, label='predicted', color='#42529C')
+        axs[1, 0].plot(f_interp, -f_interp, label='true', linestyle='--', color='#4958AD')
         axs[1, 0].set_title('Score: x=0.5')
 
         x_distr2, y_distr2 = numeric_integration(f_interp, preds2)
-        axs[1, 1].plot(x_distr2, y_distr2, label='predicted')
-        axs[1, 1].plot(x_distr2, jnp.exp(-x_distr2 ** 2) / jnp.sum(jnp.exp(-x_distr2 ** 2)), label='True')
+        axs[1, 1].plot(x_distr2, y_distr2, label='predicted', color='#42529C')
+        axs[1, 1].plot(x_distr2, jnp.exp(-x_distr2 ** 2) / jnp.sum(jnp.exp(-x_distr2 ** 2)), label='True',
+                       linestyle='--', color='#4958AD')
         axs[1, 1].set_title('Distr:  x=-0.5')
 
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
+        fig.suptitle('Iteration: ' + str(it))
+        fig.tight_layout()
+        fig.show()
 
 
 if __name__ == '__main__':
@@ -195,8 +201,6 @@ if __name__ == '__main__':
     hk_key = hk.PRNGSequence(seed)
 
     # initializer score network
-    score_net = ScoreEstimator(learning_rate=1e-3,
-                               loss_type="exact_w_spectr_norm",
-                               n_fn_samples=10)
+    score_net = ScoreEstimator(learning_rate=1e-3, loss_type="exact_w_spectr_norm")
     # train score network
     score_net.train(n_iter=200, n_fns=10, key=hk_key)

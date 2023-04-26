@@ -12,7 +12,7 @@ from collections import OrderedDict
 from MARS.models.abstract_model import BatchedNeuralNetworkModel
 from functools import partial
 from MARS.modules.ssge.estimator import SSGE
-from MARS.modules.data_modules.simulator_base import GPMetaDatasetJax, GPMetaDataset
+from MARS.modules.data_modules.simulator_base import GPMetaDataset
 
 jax.config.update("jax_enable_x64", False)
 
@@ -195,7 +195,7 @@ if __name__ == '__main__':
     domain_l, domain_u = np.array([-7.]), np.array([7.])
 
     # fit the GP
-    sim = GPMetaDatasetJax(dataset="sin_2", init_seed=next(hk_key), num_pts=num_train_pts + num_meas_pts)
+    sim = GPMetaDataset(dataset="sin_2", init_seed=next(hk_key), num_input_pts=num_train_pts + num_meas_pts)
 
     x_train, y_train, x_test, y_test = sim.meta_test_data[0]
 

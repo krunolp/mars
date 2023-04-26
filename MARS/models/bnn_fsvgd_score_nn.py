@@ -32,17 +32,17 @@ class BNN_fSVGD_MARS(BatchedNeuralNetworkModel):
                  input_size: int = None,
                  rng_key: jax.random.PRNGKey = jax.random.PRNGKey(1234),
                  output_size: int = 1,
-                 likelihood_std: float = 0.2,
-                 num_particles: int = 10,
-                 bandwidth_svgd: float = 0.2,
-                 data_batch_size: int = 8,
-                 num_measurement_points: int = 8,
+                 likelihood_std: float = 0.05,
+                 num_particles: int = 20,
+                 bandwidth_svgd: float = 1.,
+                 data_batch_size: int = 1,
+                 num_measurement_points: int = 2,
                  num_train_steps: int = 10000,
                  lr=1e-3,
                  norm_stats=None,
-                 clip_value: float = 1.,
+                 clip_value: float = .5,
                  normalize_data: bool = True,
-                 hidden_layer_sizes: List[int] = (32, 32, 32),
+                 hidden_layer_sizes: List[int] = (64, 64, 64),
                  hidden_activation: Optional[Callable] = jax.nn.leaky_relu,
                  last_activation: Optional[Callable] = None):
         self.function_sim = score_network.function_sim
@@ -55,7 +55,7 @@ class BNN_fSVGD_MARS(BatchedNeuralNetworkModel):
         assert output_size == 1
 
         initializer_b = BiasInitializer(domain_l=self.function_sim.mins.min(), domain_u=self.function_sim.maxs.max(),
-                                        key=hk_key)
+                                        key=rng_key)
         super().__init__(input_size=input_size, output_size=output_size, rng_key=rng_key,
                          data_batch_size=data_batch_size, num_train_steps=num_train_steps,
                          num_batched_nns=num_particles, hidden_layer_sizes=hidden_layer_sizes,
@@ -117,8 +117,7 @@ class BNN_fSVGD_MARS(BatchedNeuralNetworkModel):
         x_stacked = jnp.concatenate([x_batch, x_domain], axis=0)
 
         # likelihood
-        f_raw = self.batched_model.forward_vec(x_stacked,
-                                               param_vec_stack)
+        f_raw = self.batched_model.forward_vec(x_stacked,param_vec_stack)
         (_, post_stats), grad_post = jax.value_and_grad(self._neg_log_posterior_surrogate, has_aux=True)(
             f_raw, x_stacked, y_batch, train_batch_size, num_train_points, key2)
 
@@ -140,30 +139,36 @@ class BNN_fSVGD_MARS(BatchedNeuralNetworkModel):
         param_vec_stack = optax.apply_updates(param_vec_stack, updates)
         return opt_state, param_vec_stack, stats
 
-    def _nll(self, pred_raw: jnp.ndarray, y_batch: jnp.ndarray, train_data_till_idx: int):
+    def _ll(self, pred_raw: jnp.ndarray, y_batch: jnp.ndarray, train_data_till_idx: int):
         likelihood_std = self.likelihood_std
-        log_prob = tfd.MultivariateNormalDiag(pred_raw[:, :train_data_till_idx, :], likelihood_std).log_prob(
-            y_batch)
-        return - jnp.mean(log_prob)
+        log_prob = tfd.MultivariateNormalDiag(pred_raw[:, :train_data_till_idx, :], likelihood_std).log_prob(y_batch)
+        return jnp.sum(jnp.mean(log_prob,axis=-1),axis=0)
 
     def _neg_log_posterior_surrogate(self, pred_raw: jnp.ndarray, x_stacked: jnp.ndarray, y_batch: jnp.ndarray,
                                      train_data_till_idx: int, num_train_points: Union[float, int],
                                      key: jax.random.PRNGKey):
         """ Approximate negative log-posterior distribution given the data and predictions. """
-        nll = self._nll(pred_raw, y_batch, train_data_till_idx)
-        prior_score = self._estimate_prior_score(x_stacked, pred_raw,
-                                                 key) / num_train_points
+        nll = -self._ll(pred_raw, y_batch, train_data_till_idx)
+        prior_score = self._estimate_prior_score(pred_raw, x_stacked, key) / num_train_points
         neg_log_post = nll - jnp.sum(jnp.mean(pred_raw * jax.lax.stop_gradient(prior_score), axis=-2))
         stats = OrderedDict(train_nll_loss=nll)
         return neg_log_post, stats
 
-    def _estimate_prior_score(self, x: jnp.array, y: jnp.array, key: jax.random.PRNGKey) -> jnp.ndarray:
+    def _estimate_prior_score(self, pred_raw: jnp.array, x: jnp.array, key: jax.random.PRNGKey) -> jnp.ndarray:
         """ Estimating the prior score using the trained score neural network. """
-        x_and_fx = jax.vmap(lambda f_: jnp.hstack((x, f_)))(y)
+        x_and_fx = jax.vmap(lambda f_: jnp.hstack((x, f_)))(pred_raw)
         pred_score = jax.vmap(lambda x_: self.score_nn.apply(self.score_nn_params, key, x_, False))(x_and_fx)[..., None]
         pred_score = jnp.clip(pred_score, a_min=-self.clip_value, a_max=self.clip_value)
-        assert pred_score.shape == y.shape
+        assert pred_score.shape == pred_raw.shape
+
         return pred_score
+
+        # delete_score = self._normalize_y(jnp.array([self.function_sim.dataset._gp_fun_from_prior_jax(self._unnormalize_data(x)) for _ in range(100)]))
+        # mean, std = jnp.mean(delete_score, axis=0), jnp.std(delete_score, axis=0)
+        # true_score = -(x_and_fx[..., 1:] - mean) / (std)
+        # return true_score
+
+
 
     def predict_dist(self, x: jnp.ndarray, include_noise: bool = True) -> tfd.Distribution:
         """ Calculation of the predictive distribution of the network. """
@@ -192,7 +197,7 @@ if __name__ == '__main__':
     domain_l, domain_u = np.array([-7.]), np.array([7.])
 
     # fit the GP
-    sim = GPMetaDataset(dataset="sin_20", init_seed=next(hk_key), num_pts=num_train_pts + num_meas_pts)
+    sim = GPMetaDataset(dataset="sin_20", init_seed=next(hk_key), num_input_pts=num_train_pts + num_meas_pts)
     x_train, y_train, x_test, y_test = sim.meta_test_data[0]
 
     # initializer score network
@@ -206,12 +211,12 @@ if __name__ == '__main__':
     score_net.train(hk_key, n_iter=20000)
 
     # initialize fSVGD
-    bnn = BNN_fSVGD_MARS(sim.input_size, score_network=score_net, rng_key=next(hk_key), lr=1e-3,
-                              data_batch_size=num_train_pts,
-                              num_measurement_points=num_meas_pts,
-                              num_train_steps=20000,
-                              likelihood_std=0.5,
-                              bandwidth_svgd=0.2)
+    bnn = BNN_fSVGD_MARS(score_network=score_net, rng_key=next(hk_key), lr=1e-3,
+                         data_batch_size=num_train_pts,
+                         num_measurement_points=num_meas_pts,
+                         num_train_steps=20000,
+                         likelihood_std=0.5,
+                         bandwidth_svgd=0.2)
 
     # train fSVGD
     for i in range(10):

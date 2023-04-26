@@ -8,9 +8,10 @@ import warnings
 from typing import Any
 from typing import Union
 from tqdm import tqdm
-from MARS.modules.data_modules.simulator_base import GPMetaDataset, GPMetaDatasetJax
+from MARS.modules.data_modules.simulator_base import GPMetaDataset
 from MARS.modules.attention_modules.architectures_refactored import arch1
 from MARS.modules.score_network.losses import score_net_loss
+from MARS.modules.data_modules.simulator_base import GPMetaDatasetExample
 
 tfd = tfp.distributions
 psd_kernels = tfp.math.psd_kernels
@@ -72,8 +73,8 @@ class ScoreEstimator:
                  function_sim: Any,
                  sample_from_gp: bool,
                  x_dim: int = None,
-                 n_fn_samples: int = 10,
-                 learning_rate: float = 1e-2,
+                 n_fn_samples: int = 4,
+                 learning_rate: float = 1e-1,
                  weight_decay: float = 0.,
 
                  loss_type: str = "exact_sm",
@@ -83,10 +84,10 @@ class ScoreEstimator:
                  spectr_norm_const: float = 1.,
                  grad_pen_const: float = 1.,
 
-                 attn_num_layers: int = 2,
+                 attn_num_layers: int = 1,
                  attn_architecture: Any = arch1,
-                 attn_dim=64,
-                 attn_key_size=32,
+                 attn_dim=16,
+                 attn_key_size=8,
                  attn_num_heads=8,
 
                  transition_steps: int = 1000,
@@ -151,6 +152,7 @@ class ScoreEstimator:
                                    grad_pen_const=grad_pen_const
                                    )
         self.loss = loss_init.apply
+        self.spectr_norm = loss_init.spectr_norm_apply
 
     def get_x_fx(self, rng_key: jax.random.PRNGKey) -> jnp.ndarray:
         """ Obtains the concatenation of inputs & outputs from the GP interpolation. """
@@ -172,22 +174,65 @@ class ScoreEstimator:
 
         # training loop
         pbar = tqdm(range(n_iter))
+        c1, c2, c3, m1, m2, m3 = [], [], [], [], [], []
+
         for _ in pbar:
             x_fx = self.get_x_fx(next(hk_key))
+            if self.loss_type == 'exact_w_spectr_norm': param = self.spectr_norm(param)
             l, grads = jax.value_and_grad(self.loss)(param, x_fx, next(hk_key))
             updates, opt_state = self.optimizer.update(grads, opt_state, param)
             param = optax.apply_updates(param, updates)
 
             pbar.set_description("Training SNN., loss is %s" % l)
+            if self.function_sim == GPMetaDatasetExample:
+                # GP prediction
+                gp_mean, gp_std = [], []
+                for gp in self.function_sim.gps:
+                    mu_, cov_ = gp.predict(x_fx[0,:,:1], return_std=True)
+                    gp_mean.append(mu_), gp_std.append(cov_)
+
+                gp_mean, gp_std = jnp.mean(jnp.array(gp_mean), axis=0), jnp.mean(jnp.array(gp_std), axis=0)
+                gp_score = -(x_fx[..., 1] - gp_mean) / gp_std
+
+                # Predicted score
+                est_score = jax.vmap(lambda xx: self.nn.apply(param, next(hk_key), xx))(x_fx)
+
+                # True score
+                aux_y = self.function_sim.normalize_y(jnp.array([self.function_sim.dataset._gp_fun_from_prior_jax(self.function_sim.unnormalize_x(x_fx[0,:,:1])) for _ in range(100)]))
+                mean, std = jnp.mean(aux_y, axis=0), jnp.std(aux_y, axis=0)
+
+                true_score = -(x_fx[..., 1:] - mean) / std
+                true_score = true_score[...,0]
+
+                cos_sim = jnp.mean(optax.cosine_similarity(true_score, est_score, epsilon=1e-8))
+                mse = jnp.mean(jnp.linalg.norm(true_score - est_score, axis=-1))
+
+                cos_sim2 = jnp.mean(optax.cosine_similarity(true_score, gp_score, epsilon=1e-8))
+                mse2 = jnp.mean(jnp.linalg.norm(true_score - gp_score, axis=-1))
+
+                cos_sim3 = jnp.mean(optax.cosine_similarity(gp_score, est_score, epsilon=1e-8))
+                mse3 = jnp.mean(jnp.linalg.norm(gp_score - est_score, axis=-1))
+
+                print("Between true and est: ", "cos_sim: ", cos_sim, " mse: ", mse)
+                print("Between true and GP: ", "cos_sim: ", cos_sim2, " mse: ", mse2)
+                print("Between est and GP: ", "cos_sim: ", cos_sim3, " mse: ", mse3)
+                c1.append(cos_sim)
+                c2.append(cos_sim2)
+                c3.append(cos_sim3)
+                m1.append(mse)
+                m2.append(mse2)
+                m3.append(mse3)
+
 
         self.param = param
         self.opt_state = opt_state
+        return c1, c2, c3, m1, m2, m3
 
 
 if __name__ == '__main__':
     seed = 2
     key = hk.PRNGSequence(seed)
-    sim = GPMetaDataset(dataset="sin_2", init_seed=next(key), num_pts=10)
+    sim = GPMetaDataset(dataset="sin_2", init_seed=next(key), num_input_pts=10)
 
     est = ScoreEstimator(function_sim=sim,
                          sample_from_gp=True,

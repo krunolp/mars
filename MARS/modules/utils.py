@@ -1,20 +1,21 @@
 import itertools
 import haiku as hk
-import gpjax as gpx
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
+import tensorflow as tf
+import optax
 
 from sklearn.model_selection import GridSearchCV
-from MARS.modules.data_modules.gp_jax import GP as GPJ
 from typing import Any, Sequence, Union
 from pathlib import Path
-from sklearn.gaussian_process.kernels import RBF, Matern
+from sklearn.gaussian_process.kernels import RBF, Matern, ExpSineSquared
 from sklearn.gaussian_process import GaussianProcessRegressor
 from tqdm import tqdm
 from typing import List, Dict
+from functools import partial
 
 KeyArray = Union[Any, jax.random.PRNGKey]
 
@@ -93,7 +94,7 @@ def tree_unzip_leading(pytree, n):
     ]
 
 
-def plot_gpr_samples(gpr_model, n_samples, ax, x_range, y_range=None, c='BuPu', fill='Blue'):
+def plot_gpr_samples(gpr_model, n_samples, ax, x_range, y_range=None, c='Blue', fill='Blue'):
     """Plot samples drawn from the Gaussian process model.
 
     If the Gaussian process model is not trained then the drawn samples are
@@ -121,7 +122,6 @@ def plot_gpr_samples(gpr_model, n_samples, ax, x_range, y_range=None, c='BuPu', 
     plt.rcParams['figure.dpi'] = 300
     plt.rcParams['savefig.dpi'] = 300
     sns.set(rc={"figure.dpi": 300, 'savefig.dpi': 300})
-    sns.set_context('notebook')
     x = jnp.linspace(x_range[0], x_range[1], 100)
     X = x.reshape(-1, 1)
 
@@ -133,7 +133,7 @@ def plot_gpr_samples(gpr_model, n_samples, ax, x_range, y_range=None, c='BuPu', 
             x,
             single_prior,
             linestyle="-",
-            alpha=0.4,
+            alpha=0.2,
             color=c
         )
     ax.plot(x, y_mean, color="#42529C", label="Mean")
@@ -155,36 +155,35 @@ def normalize(x: jnp.ndarray, _mean: jnp.ndarray, _std: jnp.ndarray, eps: float 
     return (x - _mean[None, ...]) / (_std[None, ...] + eps)
 
 
-def get_gps_jax(meta_train_data, hk_key) -> tuple[list, dict, tuple[jnp.ndarray, jnp.ndarray]]:
-    stats, normalized_data = get_overall_norm_stats(meta_train_data)
-    gps, mins, maxs, all_scores, params = [], [], [], [], {}
-
-    kernel = gpx.Matern52()
-    for x_, y_ in tqdm(zip(*normalized_data), total=len(meta_train_data), desc='Fitting GPs to meta tasks.'):
-        gpr = GPJ(gp_kernel=kernel, random_state=hk_key)
-        gps.append(gpr.fit(x_, y_))
-        mins.append(x_.min(axis=0))
-        maxs.append(x_.max(axis=0))
-
-    mins, maxs = jnp.array(mins).min(axis=0), jnp.array(maxs).max(axis=0)
-    return gps, stats, (mins, maxs)
-
-
-def get_gps(meta_train_data) -> tuple[list, dict, tuple[jnp.ndarray, jnp.ndarray]]:
+def get_gps(meta_train_data, print_kernel=True, plot_gps=False) -> tuple[list, dict, tuple[jnp.ndarray, jnp.ndarray]]:
     stats, normalized_data = get_overall_norm_stats(meta_train_data)
     gps, mins, maxs, all_scores, params = [], [], [], [], {}
 
     for x_, y_ in tqdm(zip(*normalized_data), total=len(meta_train_data), desc='Performing CV for GP hyperparam.'):
-        _, param_scores, params = cv(x_, y_, 'neg_mean_squared_error')
+        _, _, param_scores, params = cv(x_, y_, 'neg_mean_squared_error')
         all_scores.append(param_scores)
 
-    kernel = params[jnp.argmax(jnp.array(all_scores).mean(axis=0))]['kernel']
+    kernel, alpha = [params[jnp.argmax(jnp.array(all_scores).mean(axis=0))][x] for x in ['kernel', 'alpha']]
+    if print_kernel:
+        print("Chosen kernel is: ", kernel, " and GP parameter alpha: ", alpha, ".")
+
+    count = 0
     for x_, y_ in tqdm(zip(*normalized_data), total=len(meta_train_data), desc='Fitting GPs to meta tasks.'):
-        gpr = GaussianProcessRegressor(kernel=kernel)
+        gpr = GaussianProcessRegressor(kernel=kernel, alpha=alpha)
         gps.append(gpr.fit(x_, y_))
         mins.append(x_.min(axis=0))
         maxs.append(x_.max(axis=0))
 
+        if plot_gps:
+            if count % 10 == 0:
+                sns.set_theme(style='white')
+                fig, ax1 = plt.subplots(1)
+                fig.suptitle('Chosen GP fitted to task no. '+str(count)+' from the Sinusoidal GP')
+                plot_gpr_samples(gpr, n_samples=10, ax=ax1, x_range=[jnp.min(x_), jnp.max(x_)])
+                ax1.scatter(x_, y_, label='train data')
+                ax1.legend()
+                plt.show()
+            count += 1
     mins, maxs = jnp.array(mins).min(axis=0), jnp.array(maxs).max(axis=0)
     return gps, stats, (mins, maxs)
 
@@ -276,18 +275,17 @@ class hk_BiasInitializer(hk.initializers.Initializer):
 def cv(x, y, score='neg_mean_squared_error'):
     param_grid = [{
         "kernel": [param[0] * RBF(param[1]) for param in
-                   list(itertools.product(np.logspace(-3, 3, 2), np.logspace(-3, 3, 2)))]
-    }, {
-        "kernel": [param[0] * Matern(length_scale=param[1], nu=param[2]) for param in
-                   list(itertools.product(np.logspace(-3, 3, 2), np.logspace(-3, 3, 2), [2.5]))]
-    }]
+                   list(itertools.product(np.logspace(-3, 1., 5), np.logspace(-3, 1, 5)))],
+        "alpha": [0.01, 0.05, 0.1, 0.2, 0.5]
+    },
+    ]
 
     # param_grid = [{ #fixme
     #     "kernel": [param[0] * RBF(param[1]) for param in
-    #                list(itertools.product(np.logspace(-3, 3, 10), np.logspace(-3, 3, 10)))]
+    #                list(itertools.product(np.logspace(-3, 1, 10), np.logspace(-3, 1, 10)))]
     # }, {
     #     "kernel": [param[0] * Matern(length_scale=param[1], nu=param[2]) for param in
-    #                list(itertools.product(np.logspace(-3, 3, 10), np.logspace(-3, 3, 10), [1.5, 2.5]))]
+    #                list(itertools.product(np.logspace(-3, 1, 10), np.logspace(-3, 1, 10), [1.5, 2.5]))]
     # }]
 
     gp = GaussianProcessRegressor()
@@ -296,7 +294,8 @@ def cv(x, y, score='neg_mean_squared_error'):
                        scoring='%s' % score)
     clf.fit(x, y)
 
-    return clf.best_params_['kernel'], clf.cv_results_['mean_test_score'], clf.cv_results_['params']
+    return clf.best_params_['kernel'], clf.best_params_['alpha'], clf.cv_results_['mean_test_score'], clf.cv_results_[
+        'params']
 
 
 def get_overall_norm_stats(meta_data):
@@ -323,6 +322,69 @@ def get_overall_norm_stats(meta_data):
         f_normalized.append(y_)
 
     return normalization_stats, [x_normalized, f_normalized]
+
+def get_nns_dropout_sklearn_differentdim(meta_train_data, key, dropout, start_nn_lr=1e-3, start_nn_wd=0.,
+                                         start_nn_batch_size=16,
+                                         start_nn_num_epochs=100):
+    x_concat = jnp.concatenate([jnp.array(x) for x, _ in meta_train_data])
+    f_concat = jnp.concatenate([jnp.array(f) for _, f in meta_train_data])
+    normalization_stats = {
+        'x_mean': jnp.mean(x_concat, 0)[None, ...],
+        'x_std': jnp.std(x_concat, 0)[None, ...],
+        'y_mean': jnp.mean(f_concat, 0)[None, ...],
+        'y_std': jnp.std(f_concat, 0)[None, ...],
+    }
+    mins, maxs = jnp.min(x_concat), jnp.max(x_concat)
+
+    nns = []
+    for i, (x, y) in enumerate(meta_train_data):
+        key, subkey = jax.random.split(key)
+
+        x_normalized = normalize(x[..., None], normalization_stats['x_mean'], normalization_stats['x_std'])
+        f_prior_normalized = normalize(y[..., None], normalization_stats['y_mean'], normalization_stats['y_std'])
+        temp = TrainToyDropout(x_normalized[0], dropout=dropout, rng=key, lr=start_nn_lr, wd=start_nn_wd,
+                               batch_size=start_nn_batch_size)
+        nn_forward = temp.fit(train_examples=x_normalized, train_labels=f_prior_normalized, epochs=start_nn_num_epochs, key=subkey)
+
+        nns.append(nn_forward)
+
+    return nns, normalization_stats, (mins, maxs)
+
+
+def get_nns_dropout_sklearn_multidim(meta_train_data, key, dropout, start_nn_lr=1e-3, start_nn_wd=0.,
+                                     start_nn_batch_size=16,
+                                     start_nn_num_epochs=100):
+    x_unnormalized = jnp.array([x for x, _ in
+                                meta_train_data])  # (num_datasets, num_pts, x_dim) #(len(meta_train_data), len(meta_train_data[0][0]), x_dim)
+    f_prior = jnp.array([f for _, f in meta_train_data])  # (num_datasets, num_pts)
+    normalization_stats = {
+        'x_mean': jnp.mean(jnp.vstack(x_unnormalized), 0),
+        'x_std': jnp.std(jnp.vstack(x_unnormalized), 0),
+        'y_mean': jnp.mean(f_prior)[None, ...],
+        'y_std': jnp.std(f_prior)[None, ...],
+    }
+
+    x_normalized = jax.vmap(lambda x: normalize(x, normalization_stats['x_mean'], normalization_stats['x_std']))(
+        x_unnormalized)  # (num_datasets, num_pts, x_dim)
+    f_prior_normalized = normalize(f_prior, normalization_stats['y_mean'],
+                                   normalization_stats['y_std'])  # (num_datasets, num_pts)
+
+    nns, mins, maxs = [], [], []
+
+    for i, (x_, y_) in enumerate(tqdm(zip(x_normalized, f_prior_normalized), total=len(x_normalized))):
+        key, subkey = jax.random.split(key)
+
+        temp = TrainToyDropout(x_[0], dropout=dropout, rng=key, lr=start_nn_lr, wd=start_nn_wd,
+                               batch_size=start_nn_batch_size)
+        nn_forward = temp.fit(train_examples=x_, train_labels=y_, epochs=start_nn_num_epochs, key=subkey)
+
+        nns.append(nn_forward)
+        mins.append(x_.min(axis=0))
+        maxs.append(x_.max(axis=0))
+
+    mins, maxs = jnp.array(mins).min(axis=0), jnp.array(maxs).max(axis=0)  # (x_dim,), (x_dim,)
+    return nns, normalization_stats, (mins, maxs)
+
 
 
 def tree_stack(trees):
@@ -399,3 +461,48 @@ def weighted_loss(preds, true, weight=5.):
     diff = preds - true
     loss = jnp.nanmean(jnp.abs(diff * (diff >= 0))) * weight + jnp.nanmean(jnp.abs(diff * (diff < 0)))
     return loss
+
+class TrainToyDropout:
+    def __init__(
+            self, x, rng, lr, wd, dropout, batch_size=16):
+        self.output_size = 1
+        self.dropout_rate = dropout
+        self.batch_size = batch_size
+        self.hidden_layer_sizes = np.hstack((tuple([32] * 3), np.array([self.output_size])))
+        self.nn = hk.transform(
+            lambda x_, rng_: self.feed_forward(x_, self.hidden_layer_sizes, rng_))
+        self.nn_params = self.nn.init(rng, x, rng)
+        self.optimizer = optax.adamw(learning_rate=lr, weight_decay=wd)
+
+    def loss(self, params, x, true_y, rng_key):
+        predicted = self.nn.apply(params, rng_key, x, rng_key)
+        return jnp.mean((predicted - true_y) ** 2)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def update(self, params, x, y, opt_state, rng_key):
+        loss, grads = jax.value_and_grad(self.loss)(params, x, y, rng_key)
+        updates, opt_state = self.optimizer.update(grads, opt_state, params)
+        updated_trainable_params = optax.apply_updates(params, updates)
+        return updated_trainable_params, opt_state, loss
+
+    def feed_forward(self, x: jnp.ndarray, output_sizes: np.ndarray, rng, activation=jax.nn.leaky_relu):
+        """Feed-forward function for a given initializer and output_sizes."""
+        mlp = hk.nets.MLP(output_sizes=output_sizes, activation=activation)
+        return mlp(x, dropout_rate=self.dropout_rate, rng=rng)
+
+    def fit(self, train_examples, train_labels, epochs, key):
+        train_dataset = tf.data.Dataset.from_tensor_slices((train_examples, train_labels))
+        train_dataset = train_dataset.batch(self.batch_size)
+
+        nn_params = self.nn_params
+        opt_state = self.optimizer.init(nn_params)
+        counter = 0
+
+        for i in range(epochs):
+            counter += 1
+            for x_batch, y_batch in train_dataset:
+                key, subkey=jax.random.split(key)
+                x_, y_ = jnp.array(x_batch), jnp.array(y_batch)
+                nn_params, opt_state, loss = self.update(nn_params, x_, y_, opt_state, subkey)
+                if counter % 100 == 0: print(loss)
+        return lambda x, rng: self.nn.apply(nn_params, rng, x, rng)

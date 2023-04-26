@@ -4,6 +4,7 @@ import os
 import h5py
 import yaml
 import copy
+import jax.numpy as jnp
 import json
 
 from scipy.stats import truncnorm
@@ -189,7 +190,8 @@ class SinusoidMetaDataset(MetaDataset):
 
 class GPFunctionsMetaDataset(MetaDataset):
 
-    def __init__(self, noise_std=0.1, lengthscale=1.0, mean=0.0, x_low=-5, x_high=5, random_state=None):
+    def __init__(self, noise_std=0.1, lengthscale=1.0, mean=None, x_low=-10, x_high=10, random_state=None):
+        if mean is None: mean = lambda x: x
         self.noise_std, self.lengthscale, self.mean = noise_std, lengthscale, mean
         self.x_low, self.x_high = x_low, x_high
         super().__init__(random_state)
@@ -224,7 +226,67 @@ class GPFunctionsMetaDataset(MetaDataset):
 
         K_ss = kernel(X, X, self.lengthscale)
         L = np.linalg.cholesky(K_ss + 1e-8 * np.eye(n))
-        f = self.mean + np.dot(L, self.random_state.normal(size=(n, 1)))
+        f = self.mean(X) + np.dot(L, self.random_state.normal(size=(n, 1)))
+        y = f + self.random_state.normal(scale=self.noise_std, size=f.shape)
+        return y
+
+
+class GPSinMetaDataset(MetaDataset):
+
+    def __init__(self, noise_std=0.1, lengthscale=1.0, mean=None, x_low=-4, x_high=4, random_state=None):
+        if mean is None: mean = lambda x: np.sin(x) + 0.5 * (x)
+        self.noise_std, self.lengthscale, self.mean = noise_std, lengthscale, mean
+        self.x_low, self.x_high = x_low, x_high
+        self.mean_fn = mean
+        super().__init__(random_state)
+
+    def generate_meta_test_data(self, n_tasks, n_samples_context, n_samples_test):
+        assert n_samples_test > 0
+        meta_test_tuples = []
+        for i in range(n_tasks):
+            X = self.random_state.uniform(self.x_low, self.x_high, size=(n_samples_context + n_samples_test, 1))
+            Y = self._gp_fun_from_prior(X)
+            meta_test_tuples.append(
+                (X[:n_samples_context], Y[:n_samples_context], X[n_samples_context:], Y[n_samples_context:]))
+
+        return meta_test_tuples
+
+    def generate_meta_train_data(self, n_tasks, n_samples):
+        meta_train_tuples = []
+        for i in range(n_tasks):
+            X = self.random_state.uniform(self.x_low, self.x_high, size=(n_samples, 1))
+            Y = self._gp_fun_from_prior(X)
+            meta_train_tuples.append((X, Y))
+        return meta_train_tuples
+
+    def _gp_fun_from_prior(self, X):
+        assert X.ndim == 2
+
+        n = X.shape[0]
+
+        def kernel(a, b, lengthscale):
+            sqdist = np.sum(a ** 2, 1).reshape(-1, 1) + np.sum(b ** 2, 1) - 2 * np.dot(a, b.T)
+            return np.exp(-.5 * (1 / lengthscale) * sqdist)
+
+        K_ss = kernel(X, X, self.lengthscale)
+        L = np.linalg.cholesky(K_ss + 1e-8 * np.eye(n))
+        f = self.mean(X) + np.dot(L, self.random_state.normal(size=(n, 1)))
+        y = f + self.random_state.normal(scale=self.noise_std, size=f.shape)
+        return y
+
+    def _gp_fun_from_prior_jax(self, X):
+        assert X.ndim == 2
+
+        n = X.shape[0]
+
+        def kernel(a, b, lengthscale):
+            sqdist = jnp.sum(a ** 2, 1).reshape(-1, 1) + jnp.sum(b ** 2, 1) - 2 * jnp.dot(a, b.T)
+            return jnp.exp(-.5 * (1 / lengthscale) * sqdist)
+
+        K_ss = kernel(X, X, self.lengthscale)
+        L = jnp.linalg.cholesky(K_ss + 1e-4 * np.eye(n))
+        mean_fn = lambda x: 2 * x + 5 * jnp.sin(2 * x)
+        f = mean_fn(X) + jnp.dot(L, self.random_state.normal(size=(n, 1)))
         y = f + self.random_state.normal(scale=self.noise_std, size=f.shape)
         return y
 
@@ -278,59 +340,6 @@ class GPFunctionsMultiDimDataset(MetaDataset):
         f = self.mean + np.dot(L, self.random_state.normal(size=(n, 1)))
         y = f + self.random_state.normal(scale=self.noise_std, size=f.shape)
         return y
-
-
-""" Cauchy Toy Dataset"""
-
-
-class CauchyMetaDataset(MetaDataset):
-
-    def __init__(self, noise_std=0.05, ndim_x=2, random_state=None):
-        self.noise_std = noise_std
-        self.ndim_x = ndim_x
-        super().__init__(random_state)
-
-    def generate_meta_train_data(self, n_tasks, n_samples):
-        meta_train_tuples = []
-        for i in range(n_tasks):
-            X = truncnorm.rvs(-3, 2, loc=0, scale=2.5, size=(n_samples, self.ndim_x), random_state=self.random_state)
-            Y = self._gp_fun_from_prior(X)
-            meta_train_tuples.append((X, Y))
-        return meta_train_tuples
-
-    def generate_meta_test_data(self, n_tasks, n_samples_context, n_samples_test):
-        assert n_samples_test > 0
-        meta_test_tuples = []
-        for i in range(n_tasks):
-            X = truncnorm.rvs(-3, 2, loc=0, scale=2.5, size=(n_samples_context + n_samples_test, self.ndim_x),
-                              random_state=self.random_state)
-            Y = self._gp_fun_from_prior(X)
-            meta_test_tuples.append(
-                (X[:n_samples_context], Y[:n_samples_context], X[n_samples_context:], Y[n_samples_context:]))
-
-        return meta_test_tuples
-
-    def _mean(self, x):
-        loc1 = -1 * np.ones(x.shape[-1])
-        loc2 = 2 * np.ones(x.shape[-1])
-        cauchy1 = 1 / (np.pi * (1 + (np.linalg.norm(x - loc1, axis=-1)) ** 2))
-        cauchy2 = 1 / (np.pi * (1 + (np.linalg.norm(x - loc2, axis=-1)) ** 2))
-        return 6 * cauchy1 + 3 * cauchy2 + 1
-
-    def _gp_fun_from_prior(self, X):
-        assert X.ndim == 2
-
-        n = X.shape[0]
-
-        def kernel(a, b, lengthscale):
-            sqdist = np.sum(a ** 2, 1).reshape(-1, 1) + np.sum(b ** 2, 1) - 2 * np.dot(a, b.T)
-            return np.exp(-.5 * (1 / lengthscale) * sqdist)
-
-        K_ss = kernel(X, X, 0.5)
-        L = np.linalg.cholesky(K_ss + 1e-8 * np.eye(n))
-        f = self._mean(X) + np.dot(L, self.random_state.normal(scale=0.2, size=(n, 1))).flatten()
-        y = f + self.random_state.normal(scale=self.noise_std, size=f.shape)
-        return y.reshape(-1, 1)
 
 
 """ Swissfel Dataset"""
@@ -541,6 +550,7 @@ class BerkeleySensorMetaDataset(MetaDataset):
         self.n_points_per_day = int(data_tuples[0][0].shape[0] / 4)
         return data_tuples
 
+
 """ Argus Control Dataset"""
 
 
@@ -628,8 +638,8 @@ def provide_data(dataset, seed=28, n_train_tasks=None, n_samples=None, config=No
         if config['num_test_valid_samples'] is not None:  N_TEST_SAMPLES = config['num_test_valid_samples']
 
     """ Prepare Data """
-    if 'sin' in dataset:
-        if len(dataset.split('_')) == 2:
+    if 'orig_sin' in dataset:
+        if len(dataset.split('_')) == 3:
             n_train_tasks = int(dataset.split('_')[-1])
 
         dataset = SinusoidMetaDataset(random_state=np.random.RandomState(seed))
@@ -651,6 +661,21 @@ def provide_data(dataset, seed=28, n_train_tasks=None, n_samples=None, config=No
 
         if n_train_tasks is None: n_train_tasks = 20
 
+    elif 'gp_sin' in dataset:
+        if len(dataset.split('_')) == 3:
+            n_train_tasks = int(dataset.split('_')[-1])
+
+        dataset = GPSinMetaDataset(random_state=np.random.RandomState(seed),
+                                   mean=lambda x: 2.5 * x + 7.5 * np.sin(1.25 * x)
+                                   )
+
+        if n_samples is None:
+            n_train_samples = n_context_samples = 5
+        else:
+            n_train_samples = 10
+            n_context_samples = n_samples
+        if n_train_tasks is None: n_train_tasks = 20
+
     elif 'multidim_gp' in dataset:
         dataset = GPFunctionsMultiDimDataset(random_state=np.random.RandomState(seed))
 
@@ -661,18 +686,6 @@ def provide_data(dataset, seed=28, n_train_tasks=None, n_samples=None, config=No
 
         if n_train_tasks is None: n_train_tasks = 20
 
-    elif 'cauchy' in dataset:
-        if len(dataset.split('_')) == 2:
-            n_train_tasks = int(dataset.split('_')[-1])
-
-        dataset = CauchyMetaDataset(random_state=np.random.RandomState(seed))
-
-        if n_samples is None:
-            n_train_samples = n_context_samples = 20
-        else:
-            n_train_samples = n_context_samples = n_samples
-
-        if n_train_tasks is None: n_train_tasks = 20
 
     elif 'physionet' in dataset:
         variable_id = int(dataset[-1])

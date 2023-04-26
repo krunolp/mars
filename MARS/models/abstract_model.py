@@ -217,29 +217,31 @@ class AbstactRegressionModel(RngKeyMixin):
 
         # draw the plot
         fig, ax = plt.subplots()
-        ax.scatter(x_train, y_train, label='train points')
 
         if plot_data is not None:
             x, y = plot_data
             x, y = zip(*sorted(zip(x, y)))
             ax.plot(x, y, label='true fun', linestyle='--', color='#4958AD')
         ax.plot(x_plot, pred_mean, label='pred mean', color='#42529C')
-        ax.fill_between(x_plot.flatten(), pred_mean - pred_std, pred_mean + pred_std, alpha=0.15, color='blue')
+        ax.fill_between(x_plot.flatten(), pred_mean - pred_std, pred_mean + pred_std, alpha=0.15, color='blue',
+                        label=r"$\pm$ 1 std. dev.", )
 
         if hasattr(self, 'predict_post_samples'):
             y_post_samples = self.predict_post_samples(x_plot)
             for y in y_post_samples:
                 ax.plot(x_plot, y, linewidth=0.5, alpha=0.3, color='#3169A4')
 
-        ax.plot(x_train, y_train, 'o', linewidth=2, label='$(x_i, y_i)$', alpha=0.8, markeredgecolor='blue',
+        ax.plot(x_train, y_train, 'o', linewidth=2, label='train points', alpha=0.8, markeredgecolor='blue',
                 color='white', markeredgewidth=0.5, markersize=8)
 
         if title is not None:
             ax.set_title(title)
-        ax.legend()
+        ax.legend(loc='upper left')
 
         if show:
             fig.show()
+
+        return fig
 
     def _add_checktypes_logging_filter(self):
         logger = logging.getLogger()
