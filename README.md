@@ -21,7 +21,8 @@ pip install -r requirements.txt
 
 ## Usage
 
-The following code snippet presents the core functionality of this repository.
+The following code snippet presents the core functionality of this repository. Furthermore, run_demo.py provides a short example how to run MARS-BNN/MARS-GP with the Sinusoidal meta-learning environment, and run_interpolation.py file provides a concise example on how the training dynamics of score estimator network. run_baseline.py can be used for benchmarking and hyperparameter tuning.
+
 
 ```python
 from MARS.modules.score_network.score_network import ScoreEstimator
@@ -46,6 +47,9 @@ bnn = BNN_fSVGD_MARS(score_network=score_net, num_train_steps=20000)
 eval_stats = bnn.fit(x_train, y_train, x_eval=x_test, y_eval=y_test, num_steps=10000)
 
 ```
+
+Finally, demo_MARS.ipynb contains a detailed demo code with plots and discussions regarding the overall MARS framework, whereas demo_MARS_interp_1d_exp.ipynb contains plots and discussions regarding the score estimation network. These two notebooks are probably the best point to familiarize yourself with the code.
+
 ## Loading the meta-learning datasets / environments
 The meta-learning regression environments that were used in the paper can be loaded using
  the ```provide_data``` function:
@@ -70,7 +74,12 @@ Once you call provide_data, the necessary datasets are automatically downloaded.
 If you use the MARS implementation or the meta-learning environments in your research, please cite it as follows:
 
 ```
-
+@article{pavasovic2022mars,
+  title={MARS: Meta-learning as score matching in the function space},
+  author={Pavasovic, Krunoslav Lehman and Rothfuss, Jonas and Krause, Andreas},
+  journal={arXiv preprint arXiv:2210.13319},
+  year={2022}
+}
 ```
 
 

@@ -15,7 +15,7 @@ setuptools.setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url='github.com/krunolp/mars',
-    package_dir={'mars': 'mars'},
+    package_dir={'MARS': 'MARS'},
     packages=setuptools.find_packages(),
     install_requires=[
         'numpy',
