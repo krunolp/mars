@@ -1,7 +1,7 @@
 # MARS: Meta-Learning as Score Matching in the Function Space
 
 This is a repository provides source code for MARS, introduced in the
-paper [MARS: Meta-Learning as Score Matching in the Function Space](www.arxiv.com).
+paper [MARS: Meta-Learning as Score Matching in the Function Space](https://arxiv.org/abs/2210.13319).
 
 ## Dependencies
 
